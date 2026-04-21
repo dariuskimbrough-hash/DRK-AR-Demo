@@ -1,0 +1,411 @@
+# ============================================================
+# JPMC Salesforce / Apex CI/CD Pipeline — GitHub Actions
+#
+# This workflow runs ALONGSIDE the main deploy.yml.
+# It handles everything Salesforce-specific:
+#   - Validating Apex code against a sandbox
+#   - Running Apex test classes (required by Salesforce)
+#   - Deploying metadata to Dev, Staging, and Production orgs
+#   - Enforcing 75% code coverage (Salesforce's hard requirement)
+#
+# Authentication method: JWT Bearer Flow
+#   - No username/password stored in GitHub
+#   - Uses a certificate + Connected App in Salesforce
+#   - The industry standard for Salesforce CI/CD
+# ============================================================
+
+name: ☁️ Salesforce Apex Pipeline
+
+on:
+  push:
+    branches:
+      - main
+    # Only trigger this workflow when Salesforce files change.
+    # No point running a Salesforce deploy if only a README changed.
+    paths:
+      - 'force-app/**'           # All Salesforce metadata lives here
+      - 'sfdx-project.json'      # Salesforce project config file
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'force-app/**'
+      - 'sfdx-project.json'
+
+env:
+  SLACK_CHANNEL: "#deployments"
+
+# ================================================================
+# JOBS
+# ================================================================
+jobs:
+
+  # --------------------------------------------------------------
+  # JOB 1: VALIDATE APEX CODE (runs on every Pull Request)
+  #
+  # This does NOT deploy anything.
+  # It sends the code to a scratch org or sandbox and asks
+  # Salesforce: "Would this code work if we deployed it?"
+  # Salesforce runs all the Apex tests and reports back.
+  #
+  # Kid version: It's like spell-checking your essay before
+  # turning it in — without actually handing it to the teacher yet.
+  # --------------------------------------------------------------
+  validate-apex:
+    name: 🔍 Validate Apex (Dry Run)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # Fetch full history so we can detect changed files
+
+      # Install the Salesforce CLI — the official command-line tool for Salesforce
+      # 'sf' is the modern version (previously called 'sfdx')
+      - name: Install Salesforce CLI
+        run: |
+          npm install -g @salesforce/cli
+          sf version
+
+      # Authenticate to the DEV sandbox using JWT (no password needed)
+      # The private key is stored as a GitHub Secret — never in code
+      - name: Authenticate to Dev Sandbox (JWT)
+        run: |
+          # Write the private key from GitHub Secrets to a temp file
+          echo "${{ secrets.SF_JWT_PRIVATE_KEY }}" > server.key
+
+          sf org login jwt \
+            --client-id     ${{ secrets.SF_CONSUMER_KEY_DEV }} \
+            --jwt-key-file  server.key \
+            --username      ${{ secrets.SF_USERNAME_DEV }} \
+            --instance-url  ${{ secrets.SF_INSTANCE_URL_DEV }} \
+            --alias         dev-org
+
+          # Delete the key file immediately — don't leave secrets on disk
+          rm server.key
+
+      # Figure out WHICH files changed in this PR.
+      # Only validate/deploy the changed Apex — not everything.
+      # This is called a "delta deploy" — much faster for large orgs.
+      - name: Detect changed Salesforce files
+        id: delta
+        run: |
+          # Install the delta plugin — compares commits to find changed metadata
+          echo 'y' | sf plugins install sfdx-git-delta
+
+          # Generate a package.xml containing only the changed files
+          sf sgd source delta \
+            --to   HEAD \
+            --from origin/main \
+            --output . \
+            --generate-delta
+
+          echo "Changed metadata package:"
+          cat package/package.xml
+
+      # Run a VALIDATION deploy — Salesforce checks everything but doesn't save
+      # --dry-run = validate only, do not deploy
+      # --test-level RunLocalTests = run ALL Apex tests in the org
+      - name: Validate Apex against Dev Sandbox
+        run: |
+          sf project deploy validate \
+            --manifest      package/package.xml \
+            --target-org    dev-org \
+            --test-level    RunLocalTests \
+            --wait          30 \
+            --results-dir   deploy-results/
+
+      # Publish the test results so you can see pass/fail in the PR
+      - name: Publish Apex test results
+        if: always()    # Run even if validation failed — we want to see WHY
+        uses: actions/upload-artifact@v4
+        with:
+          name: apex-validation-results
+          path: deploy-results/
+
+  # --------------------------------------------------------------
+  # JOB 2: STATIC ANALYSIS — PMD Apex Scanner
+  #
+  # Scans Apex code for bugs, security issues, and bad patterns
+  # WITHOUT running it. Like a grammar checker for code.
+  #
+  # Catches things like:
+  #   - SOQL queries inside loops (will hit governor limits)
+  #   - Empty catch blocks hiding errors
+  #   - Hardcoded IDs (breaks between environments)
+  #   - Missing sharing keywords (security risk)
+  # --------------------------------------------------------------
+  apex-static-analysis:
+    name: 🔬 Apex Static Analysis (PMD)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Salesforce CLI
+        run: npm install -g @salesforce/cli
+
+      # Install the Salesforce Code Analyzer plugin (uses PMD under the hood)
+      - name: Install SF Code Analyzer
+        run: echo 'y' | sf plugins install @salesforce/sfdx-scanner
+
+      # Run the scanner on all Apex files
+      # Severity 1 & 2 = critical/high — fail the pipeline on these
+      - name: Run PMD Apex Scanner
+        run: |
+          sf scanner run \
+            --target    "force-app/**/*.cls" \
+            --engine    pmd \
+            --severity-threshold 2 \
+            --format    sarif \
+            --outfile   apex-scan-results.sarif
+
+      # Upload results to GitHub Security tab (shows inline in PR)
+      - name: Upload scan results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: apex-scan-results.sarif
+
+  # --------------------------------------------------------------
+  # JOB 3: DEPLOY TO SALESFORCE DEV SANDBOX
+  # Automatic — runs on every merge to main
+  # The "dev" sandbox is JPMC's development Salesforce environment
+  # --------------------------------------------------------------
+  deploy-sf-dev:
+    name: 🟡 Deploy Apex → SF Dev Sandbox
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: salesforce-dev
+      url: ${{ secrets.SF_INSTANCE_URL_DEV }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Salesforce CLI + delta plugin
+        run: |
+          npm install -g @salesforce/cli
+          echo 'y' | sf plugins install sfdx-git-delta
+
+      - name: Authenticate to Dev Sandbox
+        run: |
+          echo "${{ secrets.SF_JWT_PRIVATE_KEY }}" > server.key
+          sf org login jwt \
+            --client-id    ${{ secrets.SF_CONSUMER_KEY_DEV }} \
+            --jwt-key-file server.key \
+            --username     ${{ secrets.SF_USERNAME_DEV }} \
+            --instance-url ${{ secrets.SF_INSTANCE_URL_DEV }} \
+            --alias        dev-org
+          rm server.key
+
+      - name: Generate delta package (changed files only)
+        run: |
+          sf sgd source delta \
+            --to   HEAD \
+            --from HEAD~1 \
+            --output . \
+            --generate-delta
+
+      - name: Notify Slack — SF Dev Deploy Starting
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ env.SLACK_CHANNEL }}
+          slack-message: "🟡 Deploying Apex to *SF Dev Sandbox* | Commit: `${{ github.sha }}`"
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      # DEPLOY — this time it's real (no --dry-run)
+      # RunLocalTests = Salesforce requires 75% code coverage to deploy
+      - name: Deploy Apex to Dev Sandbox
+        run: |
+          sf project deploy start \
+            --manifest   package/package.xml \
+            --target-org dev-org \
+            --test-level RunLocalTests \
+            --wait       30 \
+            --results-dir deploy-results/
+
+      - name: Upload deploy results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sf-dev-deploy-results
+          path: deploy-results/
+
+      - name: Notify Slack — SF Dev Deploy Result
+        if: always()
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ env.SLACK_CHANNEL }}
+          slack-message: "${{ job.status == 'success' && '✅ SF Dev deploy successful' || '🚨 SF Dev deploy FAILED' }} | Commit: `${{ github.sha }}`"
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+  # --------------------------------------------------------------
+  # JOB 4: DEPLOY TO SALESFORCE STAGING SANDBOX
+  # Requires manual approval from the Salesforce/DevOps Lead
+  # Staging sandbox = full copy of production Salesforce data/config
+  # --------------------------------------------------------------
+  deploy-sf-staging:
+    name: 🟠 Deploy Apex → SF Staging Sandbox
+    runs-on: ubuntu-latest
+    needs: deploy-sf-dev
+    environment:
+      name: salesforce-staging    # Configure required reviewer in GitHub Settings
+      url: ${{ secrets.SF_INSTANCE_URL_STAGING }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Salesforce CLI + delta plugin
+        run: |
+          npm install -g @salesforce/cli
+          echo 'y' | sf plugins install sfdx-git-delta
+
+      - name: Authenticate to Staging Sandbox
+        run: |
+          echo "${{ secrets.SF_JWT_PRIVATE_KEY }}" > server.key
+          sf org login jwt \
+            --client-id    ${{ secrets.SF_CONSUMER_KEY_STAGING }} \
+            --jwt-key-file server.key \
+            --username     ${{ secrets.SF_USERNAME_STAGING }} \
+            --instance-url ${{ secrets.SF_INSTANCE_URL_STAGING }} \
+            --alias        staging-org
+          rm server.key
+
+      - name: Generate delta package
+        run: |
+          sf sgd source delta \
+            --to   HEAD \
+            --from HEAD~1 \
+            --output . \
+            --generate-delta
+
+      # Run ALL tests — not just local. In staging we want full coverage check.
+      - name: Deploy Apex to Staging Sandbox
+        run: |
+          sf project deploy start \
+            --manifest   package/package.xml \
+            --target-org staging-org \
+            --test-level RunAllTestsInOrg \
+            --wait       60 \
+            --results-dir deploy-results/
+
+      - name: Upload deploy results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sf-staging-deploy-results
+          path: deploy-results/
+
+  # --------------------------------------------------------------
+  # JOB 5: DEPLOY TO SALESFORCE PRODUCTION
+  # Requires 2 approvals (same as app production)
+  # Uses "RunSpecifiedTests" — you list exactly which test classes
+  # to run, keeping the deploy fast while still meeting coverage
+  # --------------------------------------------------------------
+  deploy-sf-production:
+    name: 🔴 Deploy Apex → SF Production
+    runs-on: ubuntu-latest
+    needs: deploy-sf-staging
+    environment:
+      name: salesforce-production   # Configure 2 required reviewers in GitHub Settings
+      url: ${{ secrets.SF_INSTANCE_URL_PROD }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Salesforce CLI + delta plugin
+        run: |
+          npm install -g @salesforce/cli
+          echo 'y' | sf plugins install sfdx-git-delta
+
+      - name: Authenticate to Production Org
+        run: |
+          echo "${{ secrets.SF_JWT_PRIVATE_KEY }}" > server.key
+          sf org login jwt \
+            --client-id    ${{ secrets.SF_CONSUMER_KEY_PROD }} \
+            --jwt-key-file server.key \
+            --username     ${{ secrets.SF_USERNAME_PROD }} \
+            --instance-url https://login.salesforce.com \
+            --alias        prod-org
+          rm server.key
+
+      - name: Generate delta package
+        run: |
+          sf sgd source delta \
+            --to   HEAD \
+            --from HEAD~1 \
+            --output . \
+            --generate-delta
+
+      - name: Notify Slack — SF Production Deploy Awaiting Approval
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ env.SLACK_CHANNEL }}
+          slack-message: |
+            🔴 *SF PRODUCTION Apex deploy awaiting approval*
+            ⚠️ Requires: VP Engineering + Security Manager
+            Commit: `${{ github.sha }}`
+            Approve: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      # RunSpecifiedTests = only run the test classes we know cover this code.
+      # Faster than RunAllTestsInOrg (which can take hours in large orgs).
+      # Test class names are passed in as a comma-separated list.
+      - name: Deploy Apex to Production
+        run: |
+          sf project deploy start \
+            --manifest    package/package.xml \
+            --target-org  prod-org \
+            --test-level  RunSpecifiedTests \
+            --tests       JPMCLoanServiceTest,JPMCAccountHandlerTest,JPMCIntegrationServiceTest \
+            --wait        60 \
+            --results-dir deploy-results/
+
+      # Write Salesforce-specific audit log entry
+      - name: Write Salesforce audit log
+        run: |
+          cat > sf-audit-entry.json << EOF
+          {
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "event": "salesforce_production_deployment",
+            "commit_sha": "${{ github.sha }}",
+            "deployed_by": "${{ github.actor }}",
+            "workflow_run": "${{ github.run_id }}",
+            "target": "salesforce-production",
+            "deploy_type": "delta",
+            "test_level": "RunSpecifiedTests"
+          }
+          EOF
+          echo "SF Audit entry written"
+
+      - name: Archive SF audit log
+        uses: actions/upload-artifact@v4
+        with:
+          name: sf-production-audit-log
+          path: sf-audit-entry.json
+
+      - name: Notify Slack — SF Production Deploy Result
+        if: always()
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ env.SLACK_CHANNEL }}
+          slack-message: "${{ job.status == 'success' && '🎉 SF PRODUCTION deploy successful!' || '🚨 SF PRODUCTION deploy FAILED — check logs' }} | Commit: `${{ github.sha }}`"
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}

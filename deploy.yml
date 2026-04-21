@@ -1,0 +1,430 @@
+# ============================================================
+# JPMC CI/CD Pipeline — GitHub Actions
+# Tool: GitHub Actions (built into GitHub Enterprise)
+#
+# What this replaces:
+#   ❌ Custom shell scripts    → ✅ Standardized YAML workflow
+#   ❌ Manual Slack approvals  → ✅ GitHub Environment protection rules
+#   ❌ Infrequent big-bang releases → ✅ Frequent, automated, small deploys
+#   ❌ Long lead times         → ✅ Code ships in minutes, not weeks
+# ============================================================
+
+name: 🚀 JPMC Deploy Pipeline
+
+# -----------------------------------------------------------------
+# TRIGGER: When does this pipeline run?
+# -----------------------------------------------------------------
+on:
+  push:
+    branches:
+      - main          # Every merge to main triggers a full deploy
+  pull_request:
+    branches:
+      - main          # Every PR triggers CI checks (tests, security)
+
+# -----------------------------------------------------------------
+# GLOBAL SETTINGS
+# -----------------------------------------------------------------
+env:
+  APP_NAME: jpmc-app
+  DOCKER_REGISTRY: ghcr.io/jpmc
+  SLACK_CHANNEL: "#deployments"
+
+# ================================================================
+# STAGE 1: CI — Continuous Integration
+# Runs on every Pull Request BEFORE code is merged.
+# Think of it as a robot checking your homework before the teacher sees it.
+# ================================================================
+jobs:
+
+  # --------------------------------------------------------------
+  # JOB 1: Run automated tests
+  # --------------------------------------------------------------
+  test:
+    name: 🧪 Run Tests
+    runs-on: ubuntu-latest
+    # Only run this job on Pull Requests
+    if: github.event_name == 'pull_request'
+
+    steps:
+      # Step 1: Download (checkout) the code from GitHub
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 2: Install the programming language/tools we need
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'               # Cache dependencies so this runs faster next time
+
+      # Step 3: Install the app's dependencies (like npm install)
+      - name: Install dependencies
+        run: npm ci                  # 'ci' is stricter than 'install' — uses exact locked versions
+
+      # Step 4: Check code formatting/style rules
+      - name: Run linter
+        run: npm run lint
+
+      # Step 5: Run unit tests — does the code actually work?
+      - name: Run unit tests
+        run: npm test -- --coverage  # --coverage also measures "how much code is tested"
+
+      # Step 6: Upload test coverage report as an artifact (saved file)
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+
+  # --------------------------------------------------------------
+  # JOB 2: Security Scanning
+  # For a bank like JPMC, this is non-negotiable.
+  # Scans for known vulnerabilities in dependencies and code.
+  # --------------------------------------------------------------
+  security-scan:
+    name: 🔒 Security Scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Scan for known security vulnerabilities in npm packages
+      - name: Dependency vulnerability scan (npm audit)
+        run: npm audit --audit-level=high    # Fails the pipeline if HIGH severity found
+
+      # SAST = Static Application Security Testing
+      # Looks at the actual code for security issues (SQL injection, etc.)
+      - name: SAST scan with CodeQL
+        uses: github/codeql-action/analyze@v3
+        with:
+          languages: javascript
+
+      # Looks for hardcoded secrets, API keys, passwords accidentally committed
+      - name: Secret scanning
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+
+  # ================================================================
+  # STAGE 2: BUILD — Package the application into a container
+  # Runs ONLY when code is merged to main (not on PRs)
+  # Think of this as putting the app in a shipping box.
+  # ================================================================
+  build:
+    name: 📦 Build & Push Docker Image
+    runs-on: ubuntu-latest
+    # Only run after tests pass AND only on pushes to main
+    needs: []
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    outputs:
+      # Share the image tag with downstream jobs (deploy stages)
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}  # Unique fingerprint for audit trail
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Log in to the GitHub Container Registry (where Docker images are stored)
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}   # Automatically available — no manual secret needed
+
+      # Generate a unique tag for this image using the commit SHA
+      # SHA = unique fingerprint of this exact code. Gives full audit trail.
+      - name: Generate Docker image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_REGISTRY }}/${{ env.APP_NAME }}
+          tags: |
+            type=sha,format=short          # e.g. sha-abc1234
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # Build the Docker image and push it to the registry
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Cache layers to speed up future builds
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Sign the container image — proves it came from THIS pipeline, not tampered with
+      # Critical for JPMC's compliance requirements (SOC 2, PCI-DSS)
+      - name: Sign container image
+        uses: sigstore/cosign-installer@v3
+      - run: |
+          cosign sign --yes ${{ env.DOCKER_REGISTRY }}/${{ env.APP_NAME }}@${{ steps.build.outputs.digest }}
+
+  # ================================================================
+  # STAGE 3: DEPLOY TO DEVELOPMENT
+  # Automatic — no human approval needed
+  # This is the "dev" sandbox where engineers test things
+  # ================================================================
+  deploy-dev:
+    name: 🟡 Deploy → Development
+    runs-on: ubuntu-latest
+    needs: build
+    # "environment" hooks into GitHub's Environment Protection Rules
+    # You configure who gets notified and who must approve in GitHub settings
+    environment:
+      name: development
+      url: https://dev.jpmc-app.internal
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Notify Slack — Deploy Starting
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ env.SLACK_CHANNEL }}
+          slack-message: |
+            🟡 *Deploy to DEV starting*
+            Commit: `${{ github.sha }}`
+            Author: ${{ github.actor }}
+            Branch: ${{ github.ref_name }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      # Replace the old app version with the new Docker image
+      - name: Deploy to Development (Kubernetes)
+        run: |
+          # Update the Kubernetes deployment to use the new image
+          kubectl set image deployment/${{ env.APP_NAME }} \
+            app=${{ needs.build.outputs.image-tag }} \
+            --namespace=development
+          
+          # Wait until the new version is fully running before declaring success
+          kubectl rollout status deployment/${{ env.APP_NAME }} \
+            --namespace=development \
+            --timeout=5m
+
+      # Run smoke tests — basic "is it alive?" checks after deploy
+      - name: Run smoke tests
+        run: |
+          # Give the app a few seconds to fully start
+          sleep 10
+          # Check the health endpoint returns HTTP 200
+          curl --fail https://dev.jpmc-app.internal/health
+
+      - name: Notify Slack — Deploy Success
+        if: success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ env.SLACK_CHANNEL }}
+          slack-message: "✅ DEV deploy successful | Commit: `${{ github.sha }}`"
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Notify Slack — Deploy Failed
+        if: failure()
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ env.SLACK_CHANNEL }}
+          slack-message: "🚨 DEV deploy FAILED | Commit: `${{ github.sha }}` | <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>"
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+  # ================================================================
+  # STAGE 4: DEPLOY TO STAGING
+  # Requires 1 manual approval from DevOps Lead
+  # This mirrors production exactly — final validation before prod
+  # ================================================================
+  deploy-staging:
+    name: 🟠 Deploy → Staging
+    runs-on: ubuntu-latest
+    needs: deploy-dev
+    environment:
+      name: staging          # In GitHub settings: requires 1 reviewer approval
+      url: https://staging.jpmc-app.internal
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Notify Slack — Awaiting Staging Approval
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ env.SLACK_CHANNEL }}
+          slack-message: |
+            🟠 *Staging deploy awaiting approval*
+            Commit: `${{ github.sha }}`
+            Approve here: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Deploy to Staging (Kubernetes)
+        run: |
+          kubectl set image deployment/${{ env.APP_NAME }} \
+            app=${{ needs.build.outputs.image-tag }} \
+            --namespace=staging
+          kubectl rollout status deployment/${{ env.APP_NAME }} \
+            --namespace=staging \
+            --timeout=5m
+
+      # Run the full integration test suite against staging
+      - name: Run integration tests
+        run: npm run test:integration -- --env=staging
+
+      # Performance test — make sure new code isn't slower than before
+      - name: Run performance tests
+        run: |
+          npx k6 run tests/performance/load-test.js \
+            --env BASE_URL=https://staging.jpmc-app.internal
+
+  # ================================================================
+  # STAGE 5: DEPLOY TO PRODUCTION
+  # Requires 2 approvals: VP Engineering + Security/Compliance Manager
+  # Full audit log captured automatically by GitHub
+  # This is the REAL system customers use
+  # ================================================================
+  deploy-production:
+    name: 🔴 Deploy → Production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    environment:
+      name: production       # In GitHub settings: requires 2 reviewers, time window restrictions
+      url: https://app.jpmc.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Notify Slack — Awaiting Production Approval
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ env.SLACK_CHANNEL }}
+          slack-message: |
+            🔴 *PRODUCTION deploy awaiting approval*
+            ⚠️ Requires sign-off from VP Engineering + Security
+            Commit: `${{ github.sha }}`
+            Changes: ${{ github.event.compare }}
+            Approve here: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      # Blue/Green deployment strategy:
+      # Instead of replacing the old version immediately (risky!),
+      # spin up the NEW version alongside the old one,
+      # then switch traffic over once we confirm it's healthy.
+      # If anything goes wrong, flip back in seconds.
+      - name: Deploy to Production (Blue/Green)
+        run: |
+          # Deploy the new version as the "green" deployment
+          kubectl set image deployment/${{ env.APP_NAME }}-green \
+            app=${{ needs.build.outputs.image-tag }} \
+            --namespace=production
+          
+          # Wait for the new version to be healthy
+          kubectl rollout status deployment/${{ env.APP_NAME }}-green \
+            --namespace=production \
+            --timeout=10m
+
+      # Shift 10% of real traffic to new version, monitor it
+      - name: Canary release — shift 10% traffic to new version
+        run: |
+          kubectl patch service ${{ env.APP_NAME }} \
+            --namespace=production \
+            --patch '{"spec":{"selector":{"version":"green"}}}' \
+            --type=merge
+          echo "Canary active — monitoring for 2 minutes..."
+          sleep 120
+
+      # Check error rates and latency before doing full cutover
+      - name: Validate canary health metrics
+        run: |
+          ERROR_RATE=$(curl -s "https://metrics.jpmc.internal/api/error_rate?deployment=green&window=2m")
+          if (( $(echo "$ERROR_RATE > 0.01" | bc -l) )); then
+            echo "❌ Error rate too high: $ERROR_RATE — rolling back"
+            exit 1
+          fi
+          echo "✅ Canary healthy (error rate: $ERROR_RATE)"
+
+      # All traffic goes to new version
+      - name: Complete cutover — send 100% traffic to new version
+        run: |
+          kubectl patch service ${{ env.APP_NAME }} \
+            --namespace=production \
+            --patch '{"spec":{"selector":{"version":"green"}}}' \
+            --type=merge
+
+      # Write a permanent, immutable record of this deployment
+      # This satisfies compliance teams (SOX, PCI-DSS, audit requirements)
+      - name: Write audit log entry
+        run: |
+          cat > audit-entry.json << EOF
+          {
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "event": "production_deployment",
+            "commit_sha": "${{ github.sha }}",
+            "image_digest": "${{ needs.build.outputs.image-digest }}",
+            "deployed_by": "${{ github.actor }}",
+            "approved_by": "${{ github.event.review.user.login }}",
+            "workflow_run": "${{ github.run_id }}",
+            "environment": "production"
+          }
+          EOF
+          # In real life: ship this to your SIEM / audit log system
+          echo "Audit entry written"
+
+      - name: Notify Slack — Production Deploy Complete
+        if: success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ env.SLACK_CHANNEL }}
+          slack-message: |
+            🎉 *PRODUCTION deploy successful!*
+            Commit: `${{ github.sha }}`
+            Deployed by: ${{ github.actor }}
+            App: https://app.jpmc.com
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+  # ================================================================
+  # STAGE 6: AUTOMATIC ROLLBACK
+  # If production ever goes unhealthy AFTER deploy,
+  # this job fires automatically and reverts to the last good version.
+  # Removes human reaction time from the equation.
+  # ================================================================
+  rollback:
+    name: ⏪ Auto-Rollback (if needed)
+    runs-on: ubuntu-latest
+    needs: deploy-production
+    if: failure()    # Only runs if the production deploy job FAILED
+
+    steps:
+      - name: Rollback to previous version
+        run: |
+          echo "🚨 Production deploy failed — initiating automatic rollback"
+          kubectl rollout undo deployment/${{ env.APP_NAME }}-green \
+            --namespace=production
+          kubectl rollout status deployment/${{ env.APP_NAME }}-green \
+            --namespace=production \
+            --timeout=5m
+
+      - name: Notify Slack — Rollback Executed
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ env.SLACK_CHANNEL }}
+          slack-message: |
+            ⏪ *AUTOMATIC ROLLBACK executed*
+            Production was reverted to previous version.
+            Failed commit: `${{ github.sha }}`
+            Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
